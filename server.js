@@ -51,10 +51,33 @@ if (process.env.NODE_ENV !== "production") {
   });
 }
 
+// ── Trust proxy (required on Render/Heroku — sits behind a load balancer) ─────
+// Without this, express-rate-limit throws ERR_ERL_UNEXPECTED_X_FORWARDED_FOR
+app.set("trust proxy", 1);
+
 // ── Security middleware ───────────────────────────────────────────────────────
 app.use(helmet());
+// Allow multiple origins — Firebase has two domains (.web.app and .firebaseapp.com)
+const allowedOrigins = [
+  process.env.CLIENT_URL,
+  "http://localhost:3000",
+  "http://localhost:5173",
+].filter(Boolean);
+
+// Also allow any subdomain of firebaseapp.com and web.app
 app.use(cors({
-  origin:      process.env.CLIENT_URL || "http://localhost:3000",
+  origin: (origin, callback) => {
+    // Allow requests with no origin (mobile apps, Postman, curl)
+    if (!origin) return callback(null, true);
+    if (
+      allowedOrigins.includes(origin) ||
+      origin.endsWith(".web.app") ||
+      origin.endsWith(".firebaseapp.com")
+    ) {
+      return callback(null, true);
+    }
+    return callback(new Error(`CORS blocked: ${origin}`));
+  },
   credentials: true,
 }));
 
