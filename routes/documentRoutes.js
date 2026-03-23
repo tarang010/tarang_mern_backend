@@ -6,23 +6,13 @@ const path    = require("path");
 const router  = express.Router();
 const { protect } = require("../middleware/auth");
 const {
-  uploadDocument, getDocuments, getDocument, deleteDocument, getCaptions,
+  uploadDocument, triggerMCQ,
+  getDocuments, getDocument, deleteDocument,
+  getCaptions, getVisualization,
 } = require("../controllers/documentController");
 
-// Multer — accept only supported formats, max 50MB
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    // Use /tmp on Render (ephemeral) — file sent to Python bridge immediately and then deleted
-    const uploadDir = process.env.NODE_ENV === "production"
-      ? require("os").tmpdir()
-      : path.join(__dirname, "../../../storage/uploads");
-    cb(null, uploadDir);
-  },
-  filename: (req, file, cb) => {
-    const unique = `${Date.now()}_${Math.round(Math.random() * 1e9)}`;
-    cb(null, `${unique}_${file.originalname}`);
-  },
-});
+// ── Multer — memoryStorage (no disk writes, works on Render) ──────────────────
+const storage = multer.memoryStorage();
 
 const fileFilter = (req, file, cb) => {
   const allowed = [".pdf", ".docx", ".txt", ".md"];
@@ -37,10 +27,13 @@ const upload = multer({
   limits: { fileSize: (parseInt(process.env.MAX_FILE_SIZE_MB) || 50) * 1024 * 1024 },
 });
 
-router.post(  "/upload",  protect, upload.single("file"), uploadDocument);
-router.get(   "/",        protect, getDocuments);
-router.get(   "/:id",     protect, getDocument);
-router.delete("/:id",             protect, deleteDocument);
-router.get(  "/:docId/captions",  protect, getCaptions);
+// ── Routes ────────────────────────────────────────────────────────────────────
+router.post(  "/upload",               protect, upload.single("file"), uploadDocument);
+router.get(   "/",                     protect, getDocuments);
+router.get(   "/:id",                  protect, getDocument);
+router.delete("/:id",                  protect, deleteDocument);
+router.post(  "/:docId/trigger-mcq",   protect, triggerMCQ);
+router.get(   "/:docId/captions",      protect, getCaptions);
+router.get(   "/:docId/visualization", protect, getVisualization);
 
 module.exports = router;
