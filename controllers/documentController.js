@@ -2,15 +2,18 @@
 // TWO-PHASE PIPELINE:
 //   Phase 1 (/pipeline/audio)  — called on upload → shows player immediately
 //   Phase 2 (/pipeline/mcq)    — called when user clicks Play → MCQs generated in background
+//
+// Fix for large file 502 timeout:
+//   The bridge call now runs in the background via setImmediate.
+//   Express responds with 202 Accepted immediately, frontend polls pipelineStatus.
+//   pipelineStatus: "processing" → "audio_ready" → "ready"
 
 const Document = require("../models/Document");
 const Session  = require("../models/Session");
-const { bridge }                    = require("../config/bridge");
+const { bridge }                          = require("../config/bridge");
 const { uploadAudioBuffer, isConfigured } = require("../config/cloudinary");
 
 // ── POST /api/documents/upload ────────────────────────────────────────────────
-// PHASE 1 only: Extract → TTS → Modulate → Captions → Cloudinary → MongoDB
-// Returns to frontend as soon as audio is ready. MCQ not generated yet.
 const uploadDocument = async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ status: "error", error: "No file uploaded." });
@@ -23,119 +26,145 @@ const uploadDocument = async (req, res) => {
     voiceId        = "",
   } = req.body;
 
-  // ── Call Phase 1 bridge endpoint ─────────────────────────────────────────
-  const FormData = require("form-data");
-  const form     = new FormData();
-  form.append("file",            req.file.buffer, {
-    filename:    req.file.originalname,
-    contentType: req.file.mimetype,
-  });
-  form.append("cognitive_state", cognitiveState);
-  form.append("document_title",  documentTitle);
-  form.append("tts_engine",      ttsEngine);
-  form.append("role",            req.user.role);
-  if (voiceId) form.append("voice_id", voiceId);
-
-  const { data: bridgeRes } = await bridge.post("/pipeline/audio", form, {
-    headers:          form.getHeaders(),
-    maxContentLength: Infinity,
-    maxBodyLength:    Infinity,
-  });
-
-  const pd = bridgeRes.data;
-
-  // ── Upload MP3 to Cloudinary ──────────────────────────────────────────────
-  let audioCloudUrl = null;
-  let audioPublicId = null;
-
-  if (isConfigured() && pd.mp3_b64) {
-    try {
-      const mp3Buffer = Buffer.from(pd.mp3_b64, "base64");
-
-      // Generate a stable doc_id from content hash (used before MCQ assigns one)
-      const crypto  = require("crypto");
-      const stableId = crypto
-        .createHash("md5")
-        .update(pd.extracted_text.slice(0, 500) + Date.now())
-        .digest("hex")
-        .slice(0, 12);
-
-      const uploaded = await uploadAudioBuffer(mp3Buffer, {
-        folder:        `tarang/audio/${req.user._id}`,
-        publicId:      `${stableId}_modulated`,
-        resource_type: "video",
-      });
-      audioCloudUrl = uploaded.url;
-      audioPublicId = uploaded.publicId;
-      console.log(`✓ Audio uploaded to Cloudinary: ${audioCloudUrl}`);
-
-      // Store stable doc_id on pd so we can use it below
-      pd._stableId = stableId;
-    } catch (e) {
-      console.error("Cloudinary upload failed (non-fatal):", e.message);
-    }
-  }
-
-  // ── Save Document to MongoDB (Phase 1 data only) ──────────────────────────
-  // docId will be updated in Phase 2 when MCQ assigns the real doc_id.
-  // We use a temp stable ID derived from content hash.
-  const tempDocId = pd._stableId || require("crypto")
+  const crypto   = require("crypto");
+  const tempDocId = crypto
     .createHash("md5")
-    .update((pd.extracted_text || "").slice(0, 500) + Date.now())
+    .update(req.file.originalname + req.user._id + Date.now())
     .digest("hex")
     .slice(0, 12);
 
+  // ── Save document immediately with status "processing" ────────────────────
+  // Frontend redirects to /listen/:docId right away.
+  // Audio player shows a loading state until status becomes "audio_ready".
   const doc = await Document.findOneAndUpdate(
     { docId: tempDocId, userId: req.user._id },
     {
       $set: {
-        userId:              req.user._id,
-        docId:               tempDocId,
-        title:               pd.document_title || documentTitle,
-        originalFilename:    req.file.originalname,
-        format:              req.file.originalname.split(".").pop().toLowerCase(),
-        wordCount:           pd.word_count,
-        durationSec:         pd.duration_sec,
-        extractedText:       pd.extracted_text,
+        userId:           req.user._id,
+        docId:            tempDocId,
+        title:            documentTitle,
+        originalFilename: req.file.originalname,
+        format:           req.file.originalname.split(".").pop().toLowerCase(),
         cognitiveState,
-        beatFreqHz:          pd.beat_freq_hz,
         ttsEngine,
-        sessionsGenerated:   0,           // MCQ not done yet
-        pipelineStatus:      "audio_ready", // custom status — MCQ pending
-        pipelineError:       null,
-        audioCloudUrl,
-        audioPublicId,
-        captions:            pd.captions?.length ? pd.captions : null,
-        captionsGeneratedAt: pd.captions?.length ? new Date() : null,
-        visualizationHtml:   null,
-        visualizationType:   null,
-        extractedPath:       null,
-        ttsWavPath:          null,
-        modulatedWavPath:    null,
-        visualizationPath:   null,
+        pipelineStatus:   "processing",
+        pipelineError:    null,
+        sessionsGenerated: 0,
       }
     },
     { upsert: true, new: true, setDefaultsOnInsert: true }
   );
 
-  console.log(`✓ Phase 1 complete | docId=${tempDocId} | MCQ pending (fires on Play)`);
+  console.log(`→ Upload received | docId=${tempDocId} | file=${req.file.originalname} | size=${req.file.size} bytes`);
 
-  // Return immediately — frontend shows the player
-  res.status(201).json({
+  // ── Respond immediately with 202 — pipeline runs in background ───────────
+  res.status(202).json({
     status: "success",
     data: {
       document: doc,
-      phase:    "audio_ready",
-      message:  "Audio ready. MCQ will be generated when user clicks Play.",
+      phase:    "processing",
+      message:  "Upload received. Processing audio in background.",
     },
+  });
+
+  // ── Run Phase 1 pipeline in background ────────────────────────────────────
+  const fileBuffer    = req.file.buffer;
+  const fileOrigName  = req.file.originalname;
+  const fileMimetype  = req.file.mimetype;
+  const userId        = req.user._id;
+  const userRole      = req.user.role;
+
+  setImmediate(async () => {
+    try {
+      console.log(`→ Background Phase 1 START | docId=${tempDocId}`);
+
+      const FormData = require("form-data");
+      const form     = new FormData();
+      form.append("file", fileBuffer, {
+        filename:    fileOrigName,
+        contentType: fileMimetype,
+      });
+      form.append("cognitive_state", cognitiveState);
+      form.append("document_title",  documentTitle);
+      form.append("tts_engine",      ttsEngine);
+      form.append("role",            userRole);
+      if (voiceId) form.append("voice_id", voiceId);
+
+      console.log(`→ Calling bridge /pipeline/audio | docId=${tempDocId}`);
+      const { data: bridgeRes } = await bridge.post("/pipeline/audio", form, {
+        headers:          form.getHeaders(),
+        maxContentLength: Infinity,
+        maxBodyLength:    Infinity,
+        timeout:          600000, // 10 min for very large files
+      });
+
+      const pd = bridgeRes.data;
+      console.log(`✓ Bridge response received | docId=${tempDocId} | words=${pd.word_count} | duration=${pd.duration_sec}s`);
+
+      // ── Upload audio to Cloudinary ────────────────────────────────────────
+      let audioCloudUrl = null;
+      let audioPublicId = null;
+
+      if (isConfigured() && pd.mp3_b64) {
+        try {
+          console.log(`→ Uploading audio to Cloudinary | docId=${tempDocId} | b64_len=${pd.mp3_b64.length}`);
+          const mp3Buffer = Buffer.from(pd.mp3_b64, "base64");
+          const uploaded  = await uploadAudioBuffer(mp3Buffer, {
+            folder:        `tarang/audio/${userId}`,
+            publicId:      `${tempDocId}_modulated`,
+            resource_type: "video",
+          });
+          audioCloudUrl = uploaded.url;
+          audioPublicId = uploaded.publicId;
+          console.log(`✓ Cloudinary upload OK | docId=${tempDocId} | url=${audioCloudUrl}`);
+        } catch (e) {
+          console.error(`✗ Cloudinary upload failed (non-fatal) | docId=${tempDocId} |`, e.message);
+        }
+      }
+
+      // ── Update document with Phase 1 results ─────────────────────────────
+      await Document.findOneAndUpdate(
+        { docId: tempDocId, userId },
+        {
+          $set: {
+            title:               pd.document_title || documentTitle,
+            wordCount:           pd.word_count,
+            durationSec:         pd.duration_sec,
+            extractedText:       pd.extracted_text,
+            beatFreqHz:          pd.beat_freq_hz,
+            pipelineStatus:      "audio_ready",
+            pipelineError:       null,
+            audioCloudUrl,
+            audioPublicId,
+            captions:            pd.captions?.length ? pd.captions : null,
+            captionsGeneratedAt: pd.captions?.length ? new Date() : null,
+            extractedPath:       null,
+            ttsWavPath:          null,
+            modulatedWavPath:    null,
+            visualizationPath:   null,
+          }
+        }
+      );
+
+      console.log(`✓ Phase 1 complete | docId=${tempDocId} | status=audio_ready`);
+
+    } catch (err) {
+      console.error(`✗ Phase 1 FAILED | docId=${tempDocId} |`, err.message);
+      await Document.findOneAndUpdate(
+        { docId: tempDocId, userId: req.user._id },
+        {
+          $set: {
+            pipelineStatus: "error",
+            pipelineError:  err.message || "Pipeline failed",
+          }
+        }
+      );
+    }
   });
 };
 
 
 // ── POST /api/documents/:docId/trigger-mcq ────────────────────────────────────
-// Called by Express when the frontend fires "user clicked Play".
-// Runs MCQ generation in background — does NOT block the response.
-// Frontend polls /api/sessions/:docId/status to know when MCQs are ready.
 const triggerMCQ = async (req, res) => {
   const { docId } = req.params;
 
@@ -144,27 +173,23 @@ const triggerMCQ = async (req, res) => {
     return res.status(404).json({ status: "error", error: "Document not found." });
   }
 
-  // Already has MCQ sessions — don't regenerate
   const existingSessions = await Session.countDocuments({ docId, userId: req.user._id });
   if (existingSessions >= 3) {
     return res.json({ status: "success", data: { message: "MCQ already generated." } });
   }
 
-  // Not enough text to generate meaningful MCQs
   if (!doc.extractedText || doc.extractedText.split(" ").length < 50) {
     return res.json({ status: "success", data: { message: "Document too short for MCQ." } });
   }
 
-  // Respond immediately — MCQ runs in background
   res.json({
     status: "success",
     data: { message: "MCQ generation started in background." },
   });
 
-  // ── Fire MCQ generation asynchronously ───────────────────────────────────
   setImmediate(async () => {
     try {
-      console.log(`→ Background MCQ generation started | docId=${docId}`);
+      console.log(`→ Background MCQ START | docId=${docId}`);
 
       const { data: mcqRes } = await bridge.post("/pipeline/mcq", {
         extracted_text: doc.extractedText,
@@ -172,13 +197,12 @@ const triggerMCQ = async (req, res) => {
         doc_id:         docId,
       });
 
-      const md = mcqRes.data;
+      const md           = mcqRes.data;
       const difficulties = { 1: "Easy", 2: "Medium", 3: "Hard" };
 
       for (const n of [1, 2, 3]) {
         const qData = md[`session_${n}_questions`];
         const aData = md[`session_${n}_answers`];
-
         await Session.findOneAndUpdate(
           { docId, userId: req.user._id, sessionNumber: n },
           {
@@ -195,29 +219,23 @@ const triggerMCQ = async (req, res) => {
               correctCount:  0,
               userAnswers:   {},
               overrideUsed:  false,
-              questions:     qData?.questions   || [],
-              answerKey:     aData              || null,
-              sessionState:  md.session_state   || null,
+              questions:     qData?.questions || [],
+              answerKey:     aData            || null,
+              sessionState:  md.session_state || null,
             }
           },
           { upsert: true, new: true, setDefaultsOnInsert: true }
         );
       }
 
-      // Update document to reflect MCQ is ready
       await Document.findOneAndUpdate(
         { docId },
-        {
-          $set: {
-            sessionsGenerated: md.sessions_generated,
-            pipelineStatus:    "ready",
-          }
-        }
+        { $set: { sessionsGenerated: md.sessions_generated, pipelineStatus: "ready" } }
       );
 
-      console.log(`✓ Background MCQ complete | docId=${docId} | 3 sessions stored`);
+      console.log(`✓ Background MCQ complete | docId=${docId} | sessions=3`);
     } catch (err) {
-      console.error(`✗ Background MCQ failed | docId=${docId} |`, err.message);
+      console.error(`✗ Background MCQ FAILED | docId=${docId} |`, err.message);
       await Document.findOneAndUpdate(
         { docId },
         { $set: { pipelineError: `MCQ generation failed: ${err.message}` } }
@@ -232,7 +250,6 @@ const getDocuments = async (req, res) => {
   const docs = await Document.find({ userId: req.user._id })
     .sort({ createdAt: -1 })
     .select("-extractedText -visualizationHtml -captions");
-
   res.json({ status: "success", data: { documents: docs } });
 };
 
@@ -251,7 +268,6 @@ const deleteDocument = async (req, res) => {
   if (!doc) {
     return res.status(404).json({ status: "error", error: "Document not found." });
   }
-
   if (doc.audioPublicId && isConfigured()) {
     try {
       const { deleteAudio } = require("../config/cloudinary");
@@ -260,71 +276,39 @@ const deleteDocument = async (req, res) => {
       console.error("Cloudinary delete failed (non-fatal):", e.message);
     }
   }
-
   await Session.deleteMany({ documentId: doc._id });
   await doc.deleteOne();
-
   res.json({ status: "success", data: { message: "Document deleted." } });
 };
 
 // ── GET /api/documents/:docId/captions ───────────────────────────────────────
 const getCaptions = async (req, res) => {
   const { docId } = req.params;
-
   const doc = await Document.findOne({ docId, userId: req.user._id });
   if (!doc) {
     return res.status(404).json({ status: "error", error: "Document not found." });
   }
-
   if (doc.captions && doc.captions.length > 0) {
     return res.json({
       status: "success",
-      data: {
-        captions:    doc.captions,
-        total:       doc.captions.length,
-        cached:      true,
-        generatedAt: doc.captionsGeneratedAt,
-      },
+      data: { captions: doc.captions, total: doc.captions.length, cached: true, generatedAt: doc.captionsGeneratedAt },
     });
   }
-
-  // Fallback on-demand for old docs
   if (!doc.extractedText || !doc.durationSec) {
     return res.status(404).json({ status: "error", error: "Captions not available." });
   }
-
-  const { data } = await bridge.post("/captions", {
-    text:         doc.extractedText,
-    duration_sec: doc.durationSec,
-  });
-  const result = data.data;
-
-  await Document.findOneAndUpdate(
-    { docId },
-    { captions: result.captions, captionsGeneratedAt: new Date() }
-  );
-
-  res.json({
-    status: "success",
-    data: { captions: result.captions, total: result.total_segments, cached: false },
-  });
+  const { data } = await bridge.post("/captions", { text: doc.extractedText, duration_sec: doc.durationSec });
+  const result   = data.data;
+  await Document.findOneAndUpdate({ docId }, { captions: result.captions, captionsGeneratedAt: new Date() });
+  res.json({ status: "success", data: { captions: result.captions, total: result.total_segments, cached: false } });
 };
 
 // ── GET /api/documents/:docId/visualization ───────────────────────────────────
 const getVisualization = async (req, res) => {
   const { docId } = req.params;
-
-  const doc = await Document.findOne({ docId, userId: req.user._id })
-    .select("visualizationHtml visualizationType title");
-
-  if (!doc) {
-    return res.status(404).json({ status: "error", error: "Document not found." });
-  }
-
-  if (!doc.visualizationHtml) {
-    return res.status(404).json({ status: "error", error: "Visualization not available." });
-  }
-
+  const doc = await Document.findOne({ docId, userId: req.user._id }).select("visualizationHtml visualizationType title");
+  if (!doc) return res.status(404).json({ status: "error", error: "Document not found." });
+  if (!doc.visualizationHtml) return res.status(404).json({ status: "error", error: "Visualization not available." });
   res.setHeader("Content-Type", "text/html");
   res.send(doc.visualizationHtml);
 };
