@@ -318,3 +318,16 @@ module.exports = {
   getDocuments, getDocument, deleteDocument,
   getCaptions, getVisualization,
 };
+
+// NOTE: getDocumentByDocId is appended here — move it above module.exports in your file
+
+// ── GET /api/documents/by-doc-id/:docId ──────────────────────────────────────
+// Used by frontend polling to check pipelineStatus during background processing
+const getDocumentByDocId = async (req, res) => {
+  const { docId } = req.params;
+  const doc = await Document.findOne({ docId, userId: req.user._id });
+  if (!doc) {
+    return res.status(404).json({ status: "error", error: "Document not found." });
+  }
+  res.json({ status: "success", data: { document: doc } });
+};
