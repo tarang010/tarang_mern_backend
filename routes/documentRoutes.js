@@ -4,7 +4,7 @@
 
 const express     = require("express");
 const multer      = require("multer");
-const { protect } = require("../middleware/authMiddleware");
+const { protect } = require("../middleware/auth");
 const {
   uploadDocument,
   triggerMCQ,
