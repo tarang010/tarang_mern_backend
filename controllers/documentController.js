@@ -8,8 +8,14 @@
 
 const Document = require("../models/Document");
 const Session  = require("../models/Session");
-const { bridge }                          = require("../config/bridge");
+const { bridge, wakeBridge }              = require("../config/bridge");
 const { uploadAudioBuffer, isConfigured } = require("../config/cloudinary");
+
+// Pipeline timeout — 20 minutes.
+// Covers worst case: 200KB+ PDF → 2500+ words → 22min audio → modulation.
+// Axios timeout on FormData streams must be set via this constant AND passed
+// explicitly on every bridge.post() call — do not rely on the axios default.
+const PIPELINE_TIMEOUT_MS = 20 * 60 * 1000; // 20 minutes
 
 
 // ── POST /api/documents/upload ────────────────────────────────────────────────
@@ -77,6 +83,11 @@ const uploadDocument = async (req, res) => {
     try {
       console.log(`→ Background Phase 1 START | docId=${tempDocId}`);
 
+      // ── Wake bridge first — absorbs cold start on free tier ──────────────
+      // This polls /health until the Python pod responds (up to 90s).
+      // If the bridge is already warm this returns in < 1s.
+      await wakeBridge();
+
       const FormData = require("form-data");
       const form     = new FormData();
       form.append("file", fileBuffer, {
@@ -89,13 +100,21 @@ const uploadDocument = async (req, res) => {
       form.append("role",            userRole);
       if (voiceId) form.append("voice_id", voiceId);
 
-      console.log(`→ Calling bridge /pipeline/audio | docId=${tempDocId}`);
-      const { data: bridgeRes } = await bridge.post("/pipeline/audio", form, {
+      // ── Build axios config explicitly ─────────────────────────────────────
+      // timeout must be set here AND on the axios instance.
+      // For multipart streams, axios applies the timeout to the entire
+      // request lifecycle only when passed directly — not from defaults.
+      const axiosConfig = {
         headers:          form.getHeaders(),
         maxContentLength: Infinity,
         maxBodyLength:    Infinity,
-        timeout:          600000,
-      });
+        timeout:          PIPELINE_TIMEOUT_MS,
+        // Disable axios response data size limit — MP3 base64 can be large
+        responseType:     "json",
+      };
+
+      console.log(`→ Calling bridge /pipeline/audio | docId=${tempDocId} | timeout=${PIPELINE_TIMEOUT_MS / 60000}min`);
+      const { data: bridgeRes } = await bridge.post("/pipeline/audio", form, axiosConfig);
 
       const pd = bridgeRes.data;
       console.log(`✓ Bridge response | docId=${tempDocId} | words=${pd.word_count} | duration=${pd.duration_sec}s`);
@@ -148,7 +167,11 @@ const uploadDocument = async (req, res) => {
       console.log(`✓ Phase 1 COMPLETE | docId=${tempDocId} | status=audio_ready`);
 
     } catch (err) {
-      console.error(`✗ Phase 1 FAILED | docId=${tempDocId} |`, err.message);
+      // Log full error details so we can see if it's a timeout vs crash
+      const isTimeout = err.code === "ECONNABORTED" || err.message?.includes("timeout");
+      console.error(
+        `✗ Phase 1 FAILED | docId=${tempDocId} | type=${isTimeout ? "TIMEOUT" : "ERROR"} | ${err.message}`
+      );
       await Document.findOneAndUpdate(
         { docId: tempDocId, userId },
         { $set: { pipelineStatus: "error", pipelineError: err.message || "Pipeline failed" } }
@@ -188,6 +211,8 @@ const triggerMCQ = async (req, res) => {
         extracted_text: doc.extractedText,
         document_title: doc.title,
         doc_id:         docId,
+      }, {
+        timeout: PIPELINE_TIMEOUT_MS,  // MCQ generation (OpenAI calls) can also be slow
       });
 
       const md           = mcqRes.data;
