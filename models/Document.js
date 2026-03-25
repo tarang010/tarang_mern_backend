@@ -1,80 +1,55 @@
-// Tarang 1.0.0.1 — models/Document.js
-// STATELESS: No local file paths stored.
-// All content stored in MongoDB or Cloudinary.
+// Tarang 1.0.0.1 — models/Session.js
+// Added sessionState field — stores full state dict for stateless bridge calls.
+// Bridge reads session_state from here instead of local JSON files.
 
 const mongoose = require("mongoose");
 
-const documentSchema = new mongoose.Schema(
+const sessionSchema = new mongoose.Schema(
   {
     userId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "User", required: true, index: true,
     },
-    docId: {
-      type: String, required: true, unique: true, index: true,
+    documentId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Document", required: true,
     },
-    title: {
-      type: String, required: true, trim: true, maxlength: 200,
-    },
-    originalFilename: { type: String, required: true },
-    format:           { type: String, enum: ["pdf", "docx", "txt", "md"] },
-    wordCount:        { type: Number, default: 0 },
-    charCount:        { type: Number, default: 0 },
-    durationSec:      { type: Number, default: 0 },
+    docId:         { type: String, required: true, index: true },
+    sessionNumber: { type: Number, required: true, enum: [1, 2, 3] },
+    difficulty:    { type: String, enum: ["Easy", "Medium", "Hard"] },
 
-    // ── Content stored in MongoDB (no local files) ────────────────────────
-    extractedText:     { type: String, default: null },   // full extracted text
-    visualizationHtml: { type: String, default: null },   // admin/user viz HTML
-    visualizationType: {
+    // ── Status ────────────────────────────────────────────────────────────
+    status: {
       type: String,
-      enum: ["admin_report", "user_waveform", null],
-      default: null,
+      enum: ["pending", "locked", "available", "in_progress", "completed"],
+      default: "locked",
     },
+    startedAt:   { type: Date, default: null },
+    submittedAt: { type: Date, default: null },
 
-    // ── Captions (pre-baked during pipeline, cached after first play) ─────
-    captions:            { type: mongoose.Schema.Types.Mixed, default: null },
-    captionsGeneratedAt: { type: Date, default: null },
+    // ── Scoring ───────────────────────────────────────────────────────────
+    scorePct:       { type: Number, default: null },
+    correctCount:   { type: Number, default: 0 },
+    totalQuestions: { type: Number, default: 10 },
 
-    // ── Audio stored in Cloudinary ────────────────────────────────────────
-    audioCloudUrl:  { type: String, default: null },
-    audioPublicId:  { type: String, default: null },
+    // ── User answers (stored for weak topic analysis) ─────────────────────
+    userAnswers:  { type: mongoose.Schema.Types.Mixed, default: {} },
+    overrideUsed: { type: Boolean, default: false },
 
-    // ── Local file paths — DEPRECATED, kept for migration compatibility ───
-    // These will be null for all new documents. Safe to remove after migration.
-    extractedPath:     { type: String, default: null },
-    ttsWavPath:        { type: String, default: null },
-    modulatedWavPath:  { type: String, default: null },
-    visualizationPath: { type: String, default: null },
+    // ── MCQ data (returned by bridge, stored here — no local files) ───────
+    questions: { type: mongoose.Schema.Types.Mixed, default: [] },
+    answerKey: { type: mongoose.Schema.Types.Mixed, default: null },
 
-    // ── Cognitive settings ────────────────────────────────────────────────
-    cognitiveState: {
-      type: String,
-      enum: ["deep_focus", "memory", "calm", "deep_relaxation", "sleep"],
-      default: "deep_focus",
-    },
-    beatFreqHz: { type: Number, default: 14.0 },
-    ttsEngine:  { type: String, default: "pyttsx3" },
-    voiceId:    { type: String, default: null },
-
-    // ── Session tracking ──────────────────────────────────────────────────
-    sessionsGenerated:   { type: Number, default: 0 },
-    allSessionsComplete: { type: Boolean, default: false },
-
-    // ── Sharing metadata ──────────────────────────────────────────────────
-    isShared:         { type: Boolean, default: false },
-    sharedFrom:       { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
-    isSharedDocument: { type: Boolean, default: false },
-    shareToken:       { type: String, default: null },
-
-    // ── Pipeline status ───────────────────────────────────────────────────
-    pipelineStatus: {
-      type: String,
-      enum: ["processing", "ready", "error"],
-      default: "processing",
-    },
-    pipelineError: { type: String },
+    // ── Full session state dict (for stateless bridge calls) ──────────────
+    // This is the complete state object that file5_mcq.py reads/writes.
+    // Replaces storage/mcq/<doc_id>_session_state.json entirely.
+    // Updated by Express after every bridge call that returns updated_state.
+    sessionState: { type: mongoose.Schema.Types.Mixed, default: null },
   },
   { timestamps: true }
 );
 
-module.exports = mongoose.model("Document", documentSchema);
+// Compound index for fast lookups
+sessionSchema.index({ docId: 1, userId: 1, sessionNumber: 1 }, { unique: true });
+
+module.exports = mongoose.model("Session", sessionSchema);

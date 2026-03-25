@@ -1,6 +1,12 @@
 // Tarang 1.0.0.1 — controllers/sessionController.js
 // STATELESS: Reads session_state from MongoDB, passes to bridge as dict.
 // Bridge returns updated_state which Express saves back to MongoDB.
+//
+// v1.0.0.4 fix:
+//   submitTest was overwriting scorePct with result.score_pct (which is null
+//   for sessions 1 & 2 because scores are hidden until all 3 are done).
+//   The actual score lives in result.updated_state.sessions[n].score_pct.
+//   Fix: read the real score from updated_state when saving the session record.
 
 const Document  = require("../models/Document");
 const Session   = require("../models/Session");
@@ -9,29 +15,26 @@ const { bridge } = require("../config/bridge");
 
 
 // ── Helper: get current session_state from MongoDB ────────────────────────────
-// Reads all Session records for a doc and builds the state dict
-// that file5_mcq.py expects.
 const getSessionState = async (docId, userId) => {
   const sessions = await Session.find({ docId, userId }).sort({ sessionNumber: 1 });
   if (!sessions.length) return null;
 
-  // Use stored sessionState if available (set during pipeline)
   const withState = sessions.find(s => s.sessionState);
   if (withState?.sessionState) {
-    // Sync live data (scores, answers, status) from individual Session records
     const state = JSON.parse(JSON.stringify(withState.sessionState));
     for (const s of sessions) {
       const n = s.sessionNumber.toString();
       if (state.sessions[n]) {
-        state.sessions[n].status       = s.status;
-        state.sessions[n].started_at   = s.startedAt?.toISOString()   || null;
-        state.sessions[n].submitted_at = s.submittedAt?.toISOString() || null;
-        state.sessions[n].score_pct    = s.scorePct    ?? null;
-        state.sessions[n].override_used= s.overrideUsed || false;
-        state.sessions[n].user_answers = s.userAnswers  || {};
+        state.sessions[n].status        = s.status;
+        state.sessions[n].started_at    = s.startedAt?.toISOString()   || null;
+        state.sessions[n].submitted_at  = s.submittedAt?.toISOString() || null;
+        // ── FIX: read scorePct from MongoDB (saved correctly by saveUpdatedState)
+        // Do NOT fall back to null blindly — use the stored value
+        state.sessions[n].score_pct     = s.scorePct   ?? null;
+        state.sessions[n].override_used = s.overrideUsed || false;
+        state.sessions[n].user_answers  = s.userAnswers  || {};
       }
     }
-    // Sync top-level flags
     const doc = await Document.findOne({ docId, userId });
     if (doc) {
       state.all_sessions_complete = doc.allSessionsComplete || false;
@@ -43,20 +46,20 @@ const getSessionState = async (docId, userId) => {
   // Fallback: build state from scratch (for older documents)
   const doc = await Document.findOne({ docId, userId });
   const state = {
-    document_id:           docId,
-    document_title:        doc?.title || "",
-    num_questions:         sessions[0]?.questions?.length || 10,
-    s1_to_s2_hours:        12.0,
-    s2_to_s3_hours:        24.0,
-    current_session:       0,
-    audio_completed_at:    null,
-    sessions:              {},
-    all_sessions_complete: doc?.allSessionsComplete || false,
-    answers_unlocked:      doc?.allSessionsComplete || false,
-    poor_score_warning:    false,
+    document_id:             docId,
+    document_title:          doc?.title || "",
+    num_questions:           sessions[0]?.questions?.length || 10,
+    s1_to_s2_hours:          12.0,
+    s2_to_s3_hours:          24.0,
+    current_session:         0,
+    audio_completed_at:      null,
+    sessions:                {},
+    all_sessions_complete:   doc?.allSessionsComplete || false,
+    answers_unlocked:        doc?.allSessionsComplete || false,
+    poor_score_warning:      false,
     relistening_recommended: false,
-    sessions_meta:         {},
-    created_at:            doc?.createdAt?.toISOString() || new Date().toISOString(),
+    sessions_meta:           {},
+    created_at:              doc?.createdAt?.toISOString() || new Date().toISOString(),
   };
 
   for (const s of sessions) {
@@ -90,19 +93,19 @@ const saveUpdatedState = async (docId, userId, updated_state) => {
       { docId, userId, sessionNumber: n },
       {
         $set: {
-          status:        s.status,
-          startedAt:     s.started_at   ? new Date(s.started_at)   : null,
-          submittedAt:   s.submitted_at ? new Date(s.submitted_at) : null,
-          scorePct:      s.score_pct    ?? null,
-          overrideUsed:  s.override_used || false,
-          userAnswers:   s.user_answers  || {},
-          sessionState:  updated_state,  // persist full state for next call
+          status:       s.status,
+          startedAt:    s.started_at    ? new Date(s.started_at)   : null,
+          submittedAt:  s.submitted_at  ? new Date(s.submitted_at) : null,
+          // ── Write the real score from updated_state (never null after submit)
+          scorePct:     s.score_pct     ?? null,
+          overrideUsed: s.override_used || false,
+          userAnswers:  s.user_answers  || {},
+          sessionState: updated_state,  // persist full state for next call
         }
       }
     );
   }
 
-  // Sync top-level flags to Document
   if (updated_state.all_sessions_complete) {
     await Document.findOneAndUpdate(
       { docId },
@@ -126,7 +129,6 @@ const audioDone = async (req, res) => {
     return res.status(404).json({ status: "error", error: "Session state not found." });
   }
 
-  // Call bridge with session_state from MongoDB
   const { data } = await bridge.post("/mcq/audio-completed", {
     doc_id:        docId,
     role:          req.user.role,
@@ -135,16 +137,13 @@ const audioDone = async (req, res) => {
 
   const result = data.data;
 
-  // Save updated state back to MongoDB
   await saveUpdatedState(docId, req.user._id, result.updated_state);
 
-  // Sync Session 1 status in MongoDB
   await Session.findOneAndUpdate(
     { docId, userId: req.user._id, sessionNumber: 1 },
     { status: "available" }
   );
 
-  // Admin: unlock all 3 sessions immediately
   if (req.user.role === "admin") {
     await Session.updateMany(
       { docId, userId: req.user._id },
@@ -178,7 +177,6 @@ const getStatus = async (req, res) => {
 
   const result = data.data;
 
-  // Save if bridge detected a state change (e.g. session unlocked by time)
   if (result.updated_state) {
     await saveUpdatedState(docId, req.user._id, result.updated_state);
   }
@@ -197,7 +195,6 @@ const getQuestions = async (req, res) => {
     return res.status(404).json({ status: "error", error: "Document not found." });
   }
 
-  // Read questions for this session from MongoDB
   const sessionRecord = await Session.findOne({
     docId, userId: req.user._id, sessionNumber: sessionNum,
   });
@@ -221,10 +218,8 @@ const getQuestions = async (req, res) => {
 
     const result = data.data;
 
-    // Save updated state (started_at marked)
     if (result.updated_state) {
       await saveUpdatedState(docId, req.user._id, result.updated_state);
-      // Also update MongoDB directly
       await Session.findOneAndUpdate(
         { docId, userId: req.user._id, sessionNumber: sessionNum,
           status: { $nin: ["completed"] } },
@@ -262,7 +257,6 @@ const overrideWindow = async (req, res) => {
 
   const result = data.data;
 
-  // Save updated state
   if (result.updated_state) {
     await saveUpdatedState(docId, req.user._id, result.updated_state);
   }
@@ -294,7 +288,6 @@ const submitTest = async (req, res) => {
     return res.status(404).json({ status: "error", error: "Document not found." });
   }
 
-  // Read answer key for this session from MongoDB
   const sessionRecord = await Session.findOne({
     docId, userId: req.user._id, sessionNumber: sessionNum,
   });
@@ -307,7 +300,6 @@ const submitTest = async (req, res) => {
     return res.status(404).json({ status: "error", error: "Session state not found." });
   }
 
-  // Call bridge with session_state + answer_key_data from MongoDB
   const { data } = await bridge.post("/mcq/submit", {
     doc_id:          docId,
     session:         sessionNum,
@@ -319,12 +311,19 @@ const submitTest = async (req, res) => {
 
   const result = data.data;
 
-  // Save updated state back to MongoDB
+  // ── Save updated_state FIRST — this writes the real score_pct for this session
   if (result.updated_state) {
     await saveUpdatedState(docId, req.user._id, result.updated_state);
   }
 
-  // Update this session record directly
+  // ── FIX: read the real score from updated_state, NOT from result.score_pct
+  // result.score_pct is intentionally null for sessions 1 & 2 (hidden from user
+  // until all 3 are done). updated_state always has the real computed value.
+  const realScorePct = result.updated_state?.sessions?.[sessionNum.toString()]?.score_pct
+    ?? result.score_pct   // fallback for session 3 where result.score_pct is set
+    ?? null;
+
+  // ── Update this session record with the REAL score (not the hidden null)
   await Session.findOneAndUpdate(
     { docId, userId: req.user._id, sessionNumber: sessionNum },
     {
@@ -332,21 +331,21 @@ const submitTest = async (req, res) => {
         status:         "completed",
         submittedAt:    new Date(),
         userAnswers,
-        scorePct:       result.score_pct    ?? null,
-        correctCount:   result.correct_count ?? 0,
-        totalQuestions: result.total_questions ?? 10,
+        scorePct:       realScorePct,            // ← FIXED: was result.score_pct
+        correctCount:   result.correct_count    ?? 0,
+        totalQuestions: result.total_questions  ?? 10,
       }
     },
     { new: true }
   );
 
-  // If all sessions complete, auto-generate analytics
+  // Auto-generate analytics when all 3 sessions complete
   if (result.all_sessions_done) {
     await Document.findOneAndUpdate({ docId }, { allSessionsComplete: true });
 
     try {
-      const sessions      = await Session.find({ docId, userId: req.user._id }).sort({ sessionNumber: 1 });
-      const all_questions = {};
+      const sessions        = await Session.find({ docId, userId: req.user._id }).sort({ sessionNumber: 1 });
+      const all_questions   = {};
       const all_answer_keys = {};
       for (const s of sessions) {
         const n = s.sessionNumber;
@@ -413,8 +412,7 @@ const getResults = async (req, res) => {
     return res.status(404).json({ status: "error", error: "Session state not found." });
   }
 
-  // Read all answer keys from MongoDB
-  const sessions      = await Session.find({ docId, userId: req.user._id }).sort({ sessionNumber: 1 });
+  const sessions        = await Session.find({ docId, userId: req.user._id }).sort({ sessionNumber: 1 });
   const all_answer_keys = {};
   for (const s of sessions) {
     all_answer_keys[`session_${s.sessionNumber}`] = s.answerKey?.answers || {};
