@@ -14,7 +14,7 @@ services:
       - key: JWT_EXPIRES_IN
         value: 7d
       - key: PYTHON_BRIDGE_URL
-        value: https://tarang-python-core-engine.onrender.com
+        value: https://kyle-nondenunciatory-rugosely.ngrok-free.dev
       - key: CLOUDINARY_CLOUD_NAME
         sync: false
       - key: CLOUDINARY_API_KEY
